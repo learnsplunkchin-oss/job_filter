@@ -1,0 +1,571 @@
+For your first dashboard, I recommend establishing a schema discovery and validation phase before writing the analytics Python parser or dashboard HTML.
+
+The objective is to confirm exactly what your AAP 2.6 environment exposes through its REST API, particularly the relationships between:
+1. Job Templates
+2. Workflow Job Templates
+3. Job Executions
+4. Workflow Job Executions
+5. Workflow Nodes and their child job executions
+6. Projects and SCM branches
+7. Execution status, timestamps and duration
+This is important because the dashboard must correctly distinguish a direct job execution from a workflow execution, associate each with its template, and classify its environment as UAT or Production.
+
+I suggest building the first dashboard around these four analytical dimensions:
+- Template analytics: Job Template versus Workflow Job Template.
+- Execution analytics: Successful, failed, error, canceled and other statuses.
+- Environment analytics: UAT versus Production.
+- Time analytics: User-selected start and end dates, with monthly aggregation by default for your seven-month history.
+The following is the prerequisite API discovery procedure I would use as a senior AAP platform engineer.
+1. Confirm the API base URL first
+AAP 2.6 deployments can expose the controller API through the platform gateway or directly through the controller service. Do not assume the URL prefix until you test it.
+
+Set these variables on your administration workstation or an approved Linux host that can reach AAP:
+export AAP_URL="https://your-aap-host"
+export AAP_TOKEN="YOUR_PERSONAL_ACCESS_TOKEN"
+
+# Try the gateway-routed controller API first.
+export API_PREFIX="/api/controller/v2"
+
+
+For a directly exposed controller API, the prefix may instead be:
+export API_PREFIX="/api/v2"
+
+
+Test the API root:
+curl -sk \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  -H "Accept: application/json" \
+  "${AAP_URL}${API_PREFIX}/" | jq .
+
+
+Also test:
+curl -sk \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  -H "Accept: application/json" \
+  "${AAP_URL}/api/" | jq .
+
+
+The first request should return the controller API root and available resource links. The second helps identify the API versions exposed by the endpoint.
+
+If the first request returns 404, try /api/v2/. If it returns 401 or 403, investigate authentication or permissions before proceeding. Do not interpret an authentication failure as an absent API.
+
+Prerequisites
+- AAP read access to job templates, workflow templates, jobs, workflow jobs, projects and workflow nodes.
+- A token belonging to a service account or approved read-only analytics account.
+- Network connectivity and trusted TLS certificates. For production collection, use certificate validation rather than -k.
+- curl and jq installed on the collection host.
+- Permission to read historical execution records for the full seven-month period.
+The AAP API is the source of truth for the actual fields and relationships. The API's own browsable schema and resource responses should be inspected before fixing your normalised schema. 
+Red Hat Documentation+1
+
+2. Discover the exact API resources
+Run these GET requests first. They establish whether the required resources are accessible and show the available records.
+Purpose	API resource
+Job Templates	/job_templates/
+Workflow Job Templates	/workflow_job_templates/
+Job executions	/jobs/
+Workflow executions	/workflow_jobs/
+Workflow template nodes	/workflow_job_template_nodes/
+Workflow execution nodes	/workflow_job_nodes/
+Projects	/projects/
+
+Use this loop:
+for resource in \
+  job_templates \
+  workflow_job_templates \
+  jobs \
+  workflow_jobs \
+  workflow_job_template_nodes \
+  workflow_job_nodes \
+  projects
+do
+    echo "======================================"
+    echo "RESOURCE: ${resource}"
+    echo "======================================"
+
+    curl -sk \
+      -H "Authorization: Bearer ${AAP_TOKEN}" \
+      -H "Accept: application/json" \
+      "${AAP_URL}${API_PREFIX}/${resource}/?page_size=1" |
+      jq '{
+        count: .count,
+        next: .next,
+        result: .results[0]
+      }'
+done
+
+
+This is a discovery request, not the final collector. page_size=1 keeps the output small while revealing one actual record from each resource.
+
+If a resource returns 403, check the analytics account's read permissions. If it returns 404, check the API prefix and the resource link returned by the API root.
+3. Inspect the API's field definitions with OPTIONS
+This is one of the most important steps.
+
+A GET response tells us which fields are populated in existing records. An OPTIONS response can describe the resource's supported fields and actions.
+
+Run:
+for resource in \
+  job_templates \
+  workflow_job_templates \
+  jobs \
+  workflow_jobs \
+  workflow_job_template_nodes \
+  workflow_job_nodes \
+  projects
+do
+    echo "======================================"
+    echo "OPTIONS: ${resource}"
+    echo "======================================"
+
+    curl -sk -X OPTIONS \
+      -H "Authorization: Bearer ${AAP_TOKEN}" \
+      -H "Accept: application/json" \
+      "${AAP_URL}${API_PREFIX}/${resource}/" |
+      jq .
+done
+
+
+For a compact field listing, try:
+curl -sk -X OPTIONS \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  -H "Accept: application/json" \
+  "${AAP_URL}${API_PREFIX}/jobs/" |
+  jq '.actions.GET'
+
+
+And:
+curl -sk -X OPTIONS \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  -H "Accept: application/json" \
+  "${AAP_URL}${API_PREFIX}/workflow_jobs/" |
+  jq '.actions.GET'
+
+
+If the OPTIONS response does not expose actions.GET, preserve the complete response and inspect it. Some endpoints may return different OPTIONS information depending on the API gateway, permissions or resource.
+
+Do not build the parser based only on the fields listed below. We will compare these expected fields against your actual API output.
+4. Inspect actual records and their detail endpoints
+The list endpoint is useful for discovery, but we need individual detail records to confirm relationships and field names.
+A. Job Template
+curl -sk \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/job_templates/?page_size=5" |
+  jq '.results[] | {
+    id,
+    name,
+    description,
+    project,
+    playbook,
+    job_type,
+    status,
+    ask_scm_branch_on_launch,
+    scm_branch,
+    created,
+    modified,
+    url
+  }'
+
+
+Fields to confirm:
+- id, name
+- project and playbook
+- scm_branch
+- job_type
+- created, modified
+- Whether the template allows SCM branch override at launch
+B. Workflow Job Template
+curl -sk \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/workflow_job_templates/?page_size=5" |
+  jq '.results[] | {
+    id,
+    name,
+    description,
+    organization,
+    created,
+    modified,
+    url
+  }'
+
+
+A workflow template may not have one project or one SCM branch. Its nodes can invoke different job templates and projects. We must therefore discover its nodes separately.
+C. Job execution
+curl -sk \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/jobs/?page_size=5&order_by=-id" |
+  jq '.results[] | {
+    id,
+    name,
+    type,
+    job_template,
+    unified_job_template,
+    project,
+    status,
+    launch_type,
+    started,
+    finished,
+    elapsed,
+    scm_branch,
+    scm_revision,
+    workflow_job,
+    job_explanation,
+    url
+  }'
+
+
+These are particularly important:
+Field	Why we need it
+id	Unique execution ID
+job_template	Template relationship, if exposed
+unified_job_template	Common template relationship, if exposed
+project	Project relationship
+status	Execution outcome
+started, finished	Date filtering and trend calculation
+elapsed	Duration
+scm_branch	Actual branch associated with the execution
+workflow_job	Identifies a parent workflow, when applicable
+launch_type	Manual, scheduled, workflow, relaunch, etc.
+job_explanation	Additional execution failure explanation
+
+AAP documentation describes job context variables including the job template ID/name, SCM branch override and workflow job ID. These are useful cross-checks, but your API record is the primary source for this dashboard. 
+Red Hat Documentation+1
+
+D. Workflow job execution
+curl -sk \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/workflow_jobs/?page_size=5&order_by=-id" |
+  jq '.results[] | {
+    id,
+    name,
+    type,
+    workflow_job_template,
+    unified_job_template,
+    status,
+    launch_type,
+    started,
+    finished,
+    elapsed,
+    failed,
+    job_explanation,
+    url
+  }'
+
+
+Confirm that the workflow execution contains a reference to its workflow template. We will use this relationship to identify the template selected in the dashboard.
+E. Workflow template nodes
+First, take one workflow template ID from section B. Substitute it below:
+export WORKFLOW_TEMPLATE_ID="123"
+
+curl -sk \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/workflow_job_templates/${WORKFLOW_TEMPLATE_ID}/workflow_nodes/?page_size=100" |
+  jq '.results[] | {
+    id,
+    identifier,
+    workflow_job_template,
+    unified_job_template,
+    success_nodes,
+    failure_nodes,
+    always_nodes
+  }'
+
+
+This tells us what the workflow is configured to execute.
+F. Workflow execution nodes
+Take one workflow execution ID from section D:
+export WORKFLOW_JOB_ID="456"
+
+curl -sk \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/workflow_jobs/${WORKFLOW_JOB_ID}/workflow_nodes/?page_size=100" |
+  jq '.results[] | {
+    id,
+    identifier,
+    workflow_job,
+    job,
+    unified_job_template,
+    do_not_run,
+    success_nodes,
+    failure_nodes,
+    always_nodes
+  }'
+
+
+This is critical: it helps associate an actual workflow run with its executed child jobs and node outcomes.
+
+AAP documents the distinction between workflow template nodes and workflow execution nodes. The configured workflow graph is saved as part of the workflow execution, and its nodes can represent jobs, project synchronisations or other workflow operations. 
+Red Hat Documentation+2
+
+G. Project and SCM branch
+curl -sk \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/projects/?page_size=5" |
+  jq '.results[] | {
+    id,
+    name,
+    scm_type,
+    scm_url,
+    scm_branch,
+    status,
+    last_job_run,
+    last_job_failed,
+    last_update,
+    last_update_failed
+  }'
+
+
+We need this because a project may have a default branch, while an individual job can execute with an SCM branch override.
+
+Do not use the project default branch as the only source for environment classification.
+
+5. Confirm the relationships using detail API calls
+After you have identified real IDs from the list calls, inspect the individual resources.
+# Job Template detail
+curl -sk -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/job_templates/105/" | jq .
+
+# Workflow Job Template detail
+curl -sk -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/workflow_job_templates/205/" | jq .
+
+# Job execution detail
+curl -sk -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/jobs/10245/" | jq .
+
+# Workflow execution detail
+curl -sk -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/workflow_jobs/20245/" | jq .
+
+
+Replace the example IDs with IDs returned by your environment.
+
+We should specifically confirm:
+1. Does a job record expose job_template and/or unified_job_template?
+2. Does a workflow job record expose workflow_job_template and/or unified_job_template?
+3. Does a child job expose workflow_job?
+4. Does a workflow execution node expose job?
+5. Does the node expose the unified_job_template reference?
+6. Does the job expose its actual scm_branch?
+7. Are started, finished and elapsed populated for completed executions?
+This validation is important because we should not assume every relationship is populated in every execution type.
+6. Confirm date filtering and pagination
+For seven months of data, we need to retrieve historical executions without accidentally truncating the results.
+
+First, test the date filters:
+curl -sk \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/jobs/?started__gte=2026-04-01T00:00:00Z&started__lt=2026-11-01T00:00:00Z&page_size=5&order_by=-started" |
+  jq '{
+    count,
+    next,
+    previous,
+    results: [.results[] | {
+      id,
+      name,
+      status,
+      started,
+      finished,
+      elapsed
+    }]
+  }'
+
+
+Use the equivalent test for workflow executions:
+curl -sk \
+  -H "Authorization: Bearer ${AAP_TOKEN}" \
+  "${AAP_URL}${API_PREFIX}/workflow_jobs/?started__gte=2026-04-01T00:00:00Z&started__lt=2026-11-01T00:00:00Z&page_size=5&order_by=-started" |
+  jq '{
+    count,
+    next,
+    previous,
+    results: [.results[] | {
+      id,
+      name,
+      status,
+      started,
+      finished,
+      elapsed
+    }]
+  }'
+
+
+These are proposed filter parameters; verify that the API accepts them and returns the expected date range. The OPTIONS response and a small test query should be used to validate supported filters.
+
+For the final collector:
+- Follow the API's next URL until it is null.
+- Do not assume that one response contains all seven months.
+- Do not manually increment page numbers if the API provides a next URL.
+- Record the collection timestamp and the requested date range.
+- Retain the original API response for troubleshooting.
+Also, use a consistent reporting boundary. For your dashboard, I recommend converting timestamps to Asia/Singapore before assigning executions to reporting months. Preserve the original UTC timestamp as well.
+7. Proposed normalised schema for the first dashboard
+I recommend separating the template definitions from execution records. This avoids duplicating template information across thousands of executions.
+Proposed data model
+1. normalized_templates.json
+
+Job Template and Workflow Job Template definitions, with template_type distinguishing them.
+
+
+2. normalized_executions.json
+
+One record per direct job or workflow execution, with status, dates, duration, environment and template relationship.
+
+
+3. normalized_workflow_nodes.json
+
+Workflow execution nodes, child job IDs, node outcomes and relationships.
+
+
+4. normalized_projects.json
+
+Project IDs, project names and configured SCM branch information.
+
+
+A. Template record
+{
+  "template_id": 105,
+  "template_name": "RHEL9_Patching",
+  "template_type": "job_template",
+  "project_id": 15,
+  "project_name": "Linux Automation",
+  "playbook": "patch_rhel9.yml",
+  "configured_branch": "main",
+  "created": "2026-01-10T08:00:00Z",
+  "modified": "2026-10-20T08:00:00Z"
+}
+
+
+For a workflow template, template_type becomes workflow_job_template. Project and branch may be null because a workflow can execute jobs belonging to different projects.
+B. Execution record
+{
+  "execution_id": 10245,
+  "execution_type": "job",
+  "template_id": 105,
+  "template_type": "job_template",
+  "template_name": "RHEL9_Patching",
+  "project_id": 15,
+  "project_name": "Linux Automation",
+
+  "execution_branch": "main",
+  "template_branch": "main",
+  "project_branch": "main",
+
+  "environment": "PROD",
+  "environment_source": "execution_branch",
+  "environment_confidence": "confirmed",
+
+  "status": "successful",
+  "launch_type": "scheduled",
+
+  "started_utc": "2026-10-31T02:00:00Z",
+  "finished_utc": "2026-10-31T02:18:00Z",
+  "started_singapore": "2026-10-31T10:00:00+08:00",
+  "elapsed_seconds": 1080,
+
+  "parent_workflow_job_id": null
+}
+
+
+For a workflow execution, execution_type becomes workflow_job, and parent_workflow_job_id is null. For a child job, it should contain the parent workflow execution ID when the relationship is available.
+C. Workflow node record
+{
+  "workflow_job_id": 20245,
+  "workflow_template_id": 205,
+  "workflow_template_name": "Production_Server_Maintenance",
+
+  "workflow_node_id": 301,
+  "node_identifier": "os_patching",
+
+  "unified_job_template_id": 105,
+  "child_job_id": 10245,
+
+  "node_status": "successful"
+}
+
+
+This separate structure lets you drill down from the workflow into its individual job executions without counting child jobs as additional workflow runs.
+8. Environment classification rules
+Use the classification rules we previously established:
+Branch	Environment
+main	Production
+dev	UAT
+devfeature	UAT
+feature/*	UAT
+release/*	UAT
+Missing branch	UNKNOWN
+
+Apply the branch precedence:
+1. Actual execution branch.
+2. Job template branch.
+3. Project configured branch.
+Retain all three values, even if they are identical. Also record environment_source so the dashboard can explain how the environment was determined.
+
+For a workflow execution, derive the workflow's environment from its child jobs. If all classified child jobs agree, use that environment. If a workflow contains both UAT and Production jobs, classify the workflow as MIXED; if its children cannot be classified, use UNKNOWN. Do not force a workflow into Production merely because one child uses main.
+9. Dashboard analytics that this schema will support
+Analytics	Calculation
+Total Job Template executions	Count direct job executions
+Total Workflow executions	Count workflow job executions
+Success / failure trend	Monthly, weekly or daily status counts
+Status donut	Status distribution for selected records
+UAT / Production comparison	Execution counts and success rates by environment
+Template ranking	Most frequently executed templates
+Project breakdown	Execution volume by project
+Average duration	Average execution time by template
+Workflow analysis	Workflow status and child job outcomes
+Failure drill-down	Individual failed execution and job event details
+
+I would also retain error, canceled, running, pending and any other status returned by AAP. Do not automatically combine every non-success status into Failed. The dashboard can show a simplified success/failure view while preserving the actual status in detailed records.
+
+10. What I need you to collect before we write the parser
+I recommend doing this in two phases.
+
+Phase 1 — API schema validation
+
+Run the following seven discovery requests and preserve their output:
+- API root
+- Job Template list and detail
+- Workflow Job Template list and detail
+- Job list and detail
+- Workflow Job list and detail
+- Workflow template nodes
+- Workflow execution nodes
+- Project list
+Also preserve the OPTIONS responses for these resources.
+
+Phase 2 — Historical data validation
+
+Collect a small sample of real records, ideally:
+- One successful direct job.
+- One failed direct job.
+- One successful workflow execution.
+- One failed workflow execution.
+- One workflow containing multiple child jobs.
+- One job executed using a branch override, if available.
+This will let us validate the joins and status mapping against real data before processing all seven months.
+
+Important: redact credentials, tokens, passwords, extra_vars, sensitive inventory details and any confidential execution output before sharing API responses. We only need the metadata fields for this schema exercise.
+
+My suggested initial Ansible role structure will be:
+aap_job_analytics/
+├── defaults/
+│   └── main.yml
+├── tasks/
+│   ├── main.yml
+│   ├── discover_api.yml
+│   ├── collect_templates.yml
+│   ├── collect_executions.yml
+│   ├── collect_workflow_nodes.yml
+│   └── collect_projects.yml
+├── files/
+│   └── validate_aap_schema.py
+└── templates/
+    └── analytics_manifest.json.j2
+
+
+I would not build the final dashboard yet. First, confirm the actual API field names and relationships. Once those are validated, we can build the collector, normalisation engine and interactive Job Template / Workflow Job Template dashboard without guessing at the AAP schema.
+
+For reference, the official documentation is available here:
+- AAP 2.6 Automation Execution API Overview
+- AAP 2.6 Launch a Job Template and job context variables
+- AAP 2.6 Workflow concepts and nodes
+- AWX REST API resource reference
